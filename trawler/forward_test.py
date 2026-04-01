@@ -333,19 +333,36 @@ def settle_results():
             log.warning("Failed to refresh %s: %s", series, e)
 
     settled = 0
+    now = datetime.now(timezone.utc)
+
     for row_id, series, target_date, bucket_sub, position, fill_no, yes_at_signal in unsettled:
+        # Safety: don't settle markets that haven't closed yet
+        # Markets close at ~05:00 UTC the day AFTER target_date
+        market_close = datetime(target_date.year, target_date.month, target_date.day,
+                                 6, 0, tzinfo=timezone.utc) + timedelta(days=1)
+        if now < market_close:
+            continue  # market hasn't closed yet
+
+        # Match by close_time date (= target_date + 1 day) to get the RIGHT day's market
+        close_date = target_date + timedelta(days=1)
         cur.execute("""
             SELECT result FROM kalshi.historical_resolutions
-            WHERE series_ticker = %s AND yes_sub_title = %s AND result IS NOT NULL
-            ORDER BY close_time DESC LIMIT 1
-        """, (series, bucket_sub))
+            WHERE series_ticker = %s AND yes_sub_title = %s
+              AND close_time::date = %s AND result IS NOT NULL
+            LIMIT 1
+        """, (series, bucket_sub, close_date))
         res = cur.fetchone()
 
         if res is None:
-            # Try API directly
+            # Try API — but only look for markets closing on the right date
             try:
                 for m in client.get_markets(series_ticker=series):
-                    if m.yes_sub_title == bucket_sub and m.result:
+                    if not m.yes_sub_title == bucket_sub or not m.result:
+                        continue
+                    # Check close_time matches
+                    close_str = m.close_time if isinstance(m.close_time, str) else m.close_time.isoformat()
+                    m_close = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                    if m_close.date() == close_date:
                         res = (m.result,)
                         break
             except Exception:
