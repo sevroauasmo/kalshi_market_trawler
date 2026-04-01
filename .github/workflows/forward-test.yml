@@ -30,6 +30,7 @@ jobs:
       KALSHI_DB_URL: ${{ secrets.KALSHI_DB_URL }}
       KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
       KALSHI_PRIVATE_KEY_PATH: /tmp/kalshi_key.txt
+      KALSHI_LIVE_MODE: ${{ secrets.KALSHI_LIVE_MODE || 'false' }}
 
     steps:
       - uses: actions/checkout@v4

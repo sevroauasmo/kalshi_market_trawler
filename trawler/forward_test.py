@@ -1,16 +1,21 @@
 """
-Forward test runner for the second-favorite short strategy.
+Forward test / live trading runner for the second-favorite short strategy.
 
-Runs daily: scans open weather markets, identifies the second-favorite bucket,
-computes edge, logs the signal to kalshi.forward_test, and tracks outcome
-when the market settles.
+Strategy: Buy NO on the second-most-popular temperature bucket.
+The market systematically overprices the runner-up — it wins only 15.5% in NYC
+but gets priced at 25-35%. Buying NO at 65-83c has positive EV.
 
-Usage:
-    poetry run python -m trawler.forward_test scan     # Log today's signals
-    poetry run python -m trawler.forward_test settle   # Update settled results
-    poetry run python -m trawler.forward_test report   # Show forward test P&L
+Modes:
+    PAPER (default) — log signals and track hypothetical P&L
+    LIVE           — actually place orders via Kalshi API
+
+Commands:
+    trawler fwd scan [--window 3pm]  — scan markets, log signals
+    trawler fwd settle               — update settled results
+    trawler fwd report               — show P&L summary
 """
 import logging
+import os
 import sys
 import time as time_mod
 from datetime import datetime, timedelta, timezone
@@ -26,26 +31,41 @@ log = logging.getLogger(__name__)
 console = Console()
 ET = ZoneInfo("America/New_York")
 
-# Edge curves from backtest (overall YES win rate for second-favorite)
-CITY_EDGE = {
-    "KXHIGHNY":  {"city": "NYC",     "yes_rate": 0.155, "be_no": 0.845, "max_yes": 0.35},
-    "KXHIGHMIA": {"city": "Miami",   "yes_rate": 0.273, "be_no": 0.727, "max_yes": 0.30},
-    "KXHIGHCHI": {"city": "Chicago", "yes_rate": 0.281, "be_no": 0.719, "max_yes": 0.28},
-    "KXHIGHLAX": {"city": "LA",      "yes_rate": 0.239, "be_no": 0.761, "max_yes": 0.30},
-    "KXHIGHAUS": {"city": "Austin",  "yes_rate": 0.225, "be_no": 0.775, "max_yes": 0.30},
-    "KXHIGHDEN": {"city": "Denver",  "yes_rate": 0.263, "be_no": 0.737, "max_yes": 0.28},
+# ─── CONFIGURATION ───────────────────────────────────────────────
+LIVE_MODE = os.environ.get("KALSHI_LIVE_MODE", "false").lower() == "true"
+
+# Cities to trade. Based on realistic sim:
+# NYC: +$8,517/98 days, 85% win rate, 14.2% ROI — PRIMARY
+# Miami: +$216/98 days, 88% win rate — small sidecar
+ACTIVE_CITIES = {
+    "KXHIGHNY": {
+        "city": "NYC",
+        "yes_rate": 0.155,      # second-fav wins 15.5% of the time
+        "be_no": 0.845,         # break-even NO price
+        "max_yes": 0.35,        # don't short if second-fav > 35c
+        "min_yes": 0.08,        # don't short if second-fav < 8c
+        "max_position": 600,    # max $ to deploy per day (based on avg from sim)
+        "fill_pct": 0.30,       # buy up to 30% of hourly volume
+        "enabled": True,
+    },
+    "KXHIGHMIA": {
+        "city": "Miami",
+        "yes_rate": 0.273,
+        "be_no": 0.727,
+        "max_yes": 0.30,
+        "min_yes": 0.08,
+        "max_position": 100,
+        "fill_pct": 0.30,
+        "enabled": True,
+    },
 }
 
 
 def scan_signals(window_label=None):
-    """Scan open weather markets and log signals for today.
-
-    Args:
-        window_label: Optional label like '10am', '1pm', '3pm', '5pm'.
-                      If None, uses current time.
-    """
-    console.print(f"[bold]Scanning open weather markets for signals "
-                  f"({window_label or 'now'})...[/bold]", highlight=False)
+    """Scan open weather markets and log signals."""
+    mode_str = "[red bold]LIVE[/red bold]" if LIVE_MODE else "[cyan]PAPER[/cyan]"
+    console.print(f"Scanning markets ({window_label or 'now'}) — {mode_str} mode",
+                  highlight=False)
 
     client = KalshiClient()
     conn = get_connection()
@@ -54,63 +74,75 @@ def scan_signals(window_label=None):
     today = now.date()
     scan_label = window_label or now.strftime("%I%p").lstrip("0").lower()
 
-    signals_logged = 0
+    signals = []
 
-    for series, cfg in CITY_EDGE.items():
+    for series, cfg in ACTIVE_CITIES.items():
+        if not cfg["enabled"]:
+            continue
+
         city = cfg["city"]
         be_no = cfg["be_no"]
         max_yes = cfg["max_yes"]
+        min_yes = cfg["min_yes"]
         yes_rate = cfg["yes_rate"]
+        max_pos = cfg["max_position"]
 
-        # Get open markets for this series
         try:
             markets = list(client.get_markets(series_ticker=series, status="open"))
         except Exception as e:
-            console.print(f"  [red]{city}: failed to get markets: {e}[/red]")
+            console.print(f"  [red]{city}: failed: {e}[/red]")
             continue
 
         if not markets:
-            console.print(f"  {city}: no open markets")
+            console.print(f"  [dim]{city}: no open markets[/dim]")
             continue
 
-        # Group by event (close_time date = target day + 1)
+        # Group by target date
         events = {}
         for m in markets:
-            # Target date is close_time - 1 day (markets close day after target)
-            close_dt = datetime.fromisoformat(m.close_time.replace("Z", "+00:00")) if isinstance(m.close_time, str) else m.close_time
-            if close_dt.tzinfo is None:
-                close_dt = close_dt.replace(tzinfo=timezone.utc)
+            close_str = m.close_time if isinstance(m.close_time, str) else m.close_time.isoformat()
+            close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
             target_date = (close_dt - timedelta(days=1)).date()
             events.setdefault(target_date, []).append(m)
 
         for target_date, event_markets in sorted(events.items()):
-            # Only look at markets for tomorrow or today
             if target_date < today or target_date > today + timedelta(days=2):
                 continue
 
-            # Rank by last_price (current price, best we have for live markets)
             ranked = sorted(event_markets, key=lambda m: -(m.last_price or 0))
             if len(ranked) < 3:
                 continue
 
+            fav = ranked[0]
             second = ranked[1]
             yes_price = second.last_price or 0
-            if yes_price < 0.08 or yes_price > max_yes:
+
+            # Determine action
+            if yes_price < min_yes or yes_price > max_yes:
                 action = "SKIP"
                 ev = 0
+                reason = f"YES={yes_price:.0%} outside {min_yes:.0%}-{max_yes:.0%}"
             else:
-                no_ask = 1 - yes_price  # approximate
+                no_ask = 1 - yes_price
                 room = be_no - no_ask
                 if room < 0.02:
                     action = "SKIP"
                     ev = 0
+                    reason = f"NO={no_ask:.0%} too close to BE={be_no:.0%}"
                 else:
                     ev = (1 - yes_rate) * (1 - no_ask) - yes_rate * no_ask
-                    action = "SIGNAL" if ev > 0.02 else "MARGINAL"
+                    if ev > 0.02:
+                        action = "SIGNAL"
+                        reason = f"EV=${ev:.3f}/dollar"
+                    elif ev > 0:
+                        action = "MARGINAL"
+                        reason = f"EV=${ev:.3f}/dollar (thin)"
+                    else:
+                        action = "SKIP"
+                        reason = f"EV=${ev:.3f} negative"
 
-            # Estimate position size (conservative: $100 base)
-            hourly_vol = second.volume or 0
-            position = min(100, hourly_vol * 0.3) if hourly_vol > 0 else 100
+            # Position sizing
+            position = min(max_pos, 100) if action == "SIGNAL" else 0
 
             # Log to DB
             cur.execute("""
@@ -124,38 +156,60 @@ def scan_signals(window_label=None):
             """, (
                 today, city, series, target_date, second.yes_sub_title,
                 2, now, yes_price, 1 - yes_price,
-                hourly_vol, position, 1 - yes_price + 0.01, be_no,
+                second.volume or 0, position, 1 - yes_price + 0.01, be_no,
                 round(ev, 4), action,
-                f"window={scan_label} R1={ranked[0].yes_sub_title}@{ranked[0].last_price:.2f}",
+                f"window={scan_label} fav={fav.yes_sub_title}@{fav.last_price:.2f} {reason}",
             ))
-            signals_logged += 1
 
-            status_color = "green" if action == "SIGNAL" else ("yellow" if action == "MARGINAL" else "dim")
+            color = {"SIGNAL": "green", "MARGINAL": "yellow", "SKIP": "dim"}[action]
             console.print(
-                f"  [{status_color}]{city} {target_date}: {second.yes_sub_title} "
-                f"YES={yes_price:.0%} NO≈{1-yes_price:.0%} EV={ev:.3f} → {action}[/{status_color}]"
+                f"  [{color}]{city} {target_date}: {second.yes_sub_title} "
+                f"YES={yes_price:.0%} EV={ev:.3f} → {action} "
+                f"(fav={fav.yes_sub_title}@{fav.last_price:.0%})[/{color}]"
             )
+
+            if action == "SIGNAL":
+                signals.append({
+                    "city": city, "series": series, "target": target_date,
+                    "ticker": second.ticker, "sub": second.yes_sub_title,
+                    "yes_price": yes_price, "position": position,
+                })
 
     conn.commit()
     conn.close()
+
+    # ─── LIVE MODE: Place orders ─────────────────────────────────
+    if LIVE_MODE and signals:
+        console.print(f"\n[red bold]LIVE MODE: Would place {len(signals)} orders[/red bold]")
+        for sig in signals:
+            no_price = 1 - sig["yes_price"]
+            contracts = int(sig["position"] / no_price)
+            console.print(
+                f"  → BUY {contracts} NO on {sig['ticker']} @ {no_price:.2f} "
+                f"(${sig['position']:.0f})"
+            )
+            # TODO: Implement actual order placement via Kalshi API
+            # client_auth = KalshiClient(authenticated=True)
+            # client_auth.place_order(ticker=sig['ticker'], side='no',
+            #                         count=contracts, price=no_price)
+        console.print("[red]Order placement not yet implemented — "
+                      "set up authenticated API access first[/red]")
+    elif LIVE_MODE:
+        console.print("\n[yellow]LIVE MODE active but no signals today[/yellow]")
+
     client.close()
-    console.print(f"\nLogged {signals_logged} signals.")
+    console.print(f"\nLogged {len(signals)} signals, "
+                  f"{sum(1 for s in ACTIVE_CITIES.values() if s['enabled'])} cities active.")
 
 
 def settle_results():
-    """Check settled markets and update forward test entries with results.
-
-    First refreshes market data from Kalshi API for recent markets,
-    then matches against unsettled forward test entries.
-    """
+    """Check settled markets and update forward test entries."""
     console.print("[bold]Settling forward test results...[/bold]")
 
-    # Step 1: Refresh recent market results from API
     client = KalshiClient()
     conn = get_connection()
     cur = conn.cursor()
 
-    # Get unsettled entries
     cur.execute("""
         SELECT id, series_ticker, target_date, bucket_sub, position_size,
                estimated_fill_no, yes_price_at_signal
@@ -171,10 +225,17 @@ def settle_results():
         client.close()
         return
 
-    # Step 2: For each unsettled entry, check if market has settled
+    # Also refresh our market data for these series
+    series_to_refresh = set(r[1] for r in unsettled)
+    for series in series_to_refresh:
+        try:
+            from trawler.scanner.discover import ingest_resolutions
+            ingest_resolutions(series, client)
+        except Exception as e:
+            log.warning("Failed to refresh %s: %s", series, e)
+
     settled = 0
     for row_id, series, target_date, bucket_sub, position, fill_no, yes_at_signal in unsettled:
-        # First check our DB
         cur.execute("""
             SELECT result FROM kalshi.historical_resolutions
             WHERE series_ticker = %s AND yes_sub_title = %s AND result IS NOT NULL
@@ -183,18 +244,14 @@ def settle_results():
         res = cur.fetchone()
 
         if res is None:
-            # Try pulling from API
+            # Try API directly
             try:
-                markets = list(client.get_markets(series_ticker=series))
-                for m in markets:
+                for m in client.get_markets(series_ticker=series):
                     if m.yes_sub_title == bucket_sub and m.result:
                         res = (m.result,)
-                        # Also update our DB
-                        from trawler.db.resolutions_repo import upsert_markets
-                        upsert_markets([m])
                         break
-            except Exception as e:
-                log.warning("Failed to check API for %s: %s", series, e)
+            except Exception:
+                pass
 
         if res is None:
             continue
@@ -202,7 +259,6 @@ def settle_results():
         result = res[0]
         fill = float(fill_no) if fill_no else 0.75
         pos = float(position) if position else 100
-        yes_sig = float(yes_at_signal) if yes_at_signal else 0.25
 
         if result == "no":
             n_contracts = pos / fill
@@ -210,7 +266,7 @@ def settle_results():
         else:
             pnl = -pos
 
-        roi = pnl / pos if pos else 0
+        roi = pnl / pos * 100 if pos else 0
 
         cur.execute("""
             UPDATE kalshi.forward_test
@@ -221,7 +277,7 @@ def settle_results():
 
         color = "green" if pnl > 0 else "red"
         console.print(f"  [{color}]{series} {target_date} {bucket_sub}: "
-                       f"result={result} P&L=${pnl:+,.0f} ROI={roi:+.0%}[/{color}]")
+                       f"{result} P&L=${pnl:+,.0f} ROI={roi:+.0f}%[/{color}]")
 
     conn.commit()
     conn.close()
@@ -230,72 +286,104 @@ def settle_results():
 
 
 def report():
-    """Print forward test summary."""
+    """Print forward test summary with running P&L."""
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute("""
         SELECT city, test_date, target_date, bucket_sub, action,
-               yes_price_at_signal, ev_per_dollar, position_size,
-               actual_result, actual_pnl
+               yes_price_at_signal::float, no_ask_at_signal::float,
+               ev_per_dollar::float, position_size::float,
+               actual_result, actual_pnl::float, notes
         FROM kalshi.forward_test
-        ORDER BY test_date, city
+        ORDER BY test_date, city, target_date
     """)
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
-        console.print("No forward test data yet.")
+        console.print("No forward test data yet. Run: trawler fwd scan")
         return
 
+    # Signals table
     table = Table(title="Forward Test Log")
-    table.add_column("Date")
+    table.add_column("Date", style="dim")
     table.add_column("City")
     table.add_column("Target")
     table.add_column("Bucket")
-    table.add_column("Action")
+    table.add_column("Act", justify="center")
     table.add_column("YES", justify="right")
+    table.add_column("NO", justify="right")
     table.add_column("EV/$", justify="right")
     table.add_column("Size", justify="right")
-    table.add_column("Result")
+    table.add_column("Result", justify="center")
     table.add_column("P&L", justify="right")
 
     total_pnl = 0
+    total_deployed = 0
     total_trades = 0
     total_wins = 0
+    cum_pnl = 0
+    peak = 0
+    max_dd = 0
 
-    for city, test_dt, target_dt, sub, action, yes_p, ev, size, result, pnl in rows:
+    for (city, test_dt, target_dt, sub, action, yes_p, no_p,
+         ev, size, result, pnl, notes) in rows:
+
+        if action not in ("SIGNAL", "MARGINAL"):
+            continue
+
         if pnl is not None:
-            total_pnl += float(pnl)
+            cum_pnl += pnl
+            total_pnl += pnl
             total_trades += 1
-            if float(pnl) > 0:
+            if pnl > 0:
                 total_wins += 1
+            total_deployed += (size or 0)
+            peak = max(peak, cum_pnl)
+            max_dd = max(max_dd, peak - cum_pnl)
 
-        pnl_str = f"${float(pnl):+,.0f}" if pnl is not None else ""
-        pnl_style = "green" if pnl and float(pnl) > 0 else ("red" if pnl and float(pnl) < 0 else "")
-        result_str = result if result else "pending"
+        pnl_str = f"${pnl:+,.0f}" if pnl is not None else ""
+        pnl_style = "green" if pnl and pnl > 0 else ("red" if pnl and pnl < 0 else "")
+        result_str = result.upper() if result else "[yellow]pending[/yellow]"
 
         table.add_row(
-            str(test_dt), city, str(target_dt), sub or "", action or "",
-            f"{float(yes_p):.0%}" if yes_p else "",
-            f"{float(ev):.3f}" if ev else "",
-            f"${float(size):.0f}" if size else "",
+            str(test_dt), city, str(target_dt), sub or "",
+            f"[green]{action}[/green]" if action == "SIGNAL" else f"[yellow]{action}[/yellow]",
+            f"{yes_p:.0%}" if yes_p else "",
+            f"{no_p:.0%}" if no_p else "",
+            f"{ev:.3f}" if ev else "",
+            f"${size:.0f}" if size else "",
             result_str,
             f"[{pnl_style}]{pnl_str}[/{pnl_style}]" if pnl_str else "",
         )
 
     console.print(table)
 
+    # Summary stats
     if total_trades:
-        console.print(f"\nSettled: {total_trades} trades, {total_wins} wins "
-                       f"({total_wins*100//total_trades}%), P&L: ${total_pnl:+,.0f}")
+        roi = total_pnl / total_deployed * 100 if total_deployed else 0
+        console.print(f"\n[bold]Summary:[/bold]")
+        console.print(f"  Trades: {total_trades}, Wins: {total_wins} "
+                       f"({total_wins*100//total_trades}%)")
+        console.print(f"  P&L: ${total_pnl:+,.0f}, Deployed: ${total_deployed:,.0f}, "
+                       f"ROI: {roi:+.1f}%")
+        console.print(f"  Max drawdown: ${max_dd:,.0f}")
+
+    pending = sum(1 for r in rows if r[4] in ("SIGNAL", "MARGINAL") and r[9] is None)
+    if pending:
+        console.print(f"\n  [yellow]{pending} signals pending settlement[/yellow]")
+
+    console.print(f"\n  Mode: {'[red bold]LIVE[/red bold]' if LIVE_MODE else '[cyan]PAPER[/cyan]'}")
+    console.print(f"  To go live: export KALSHI_LIVE_MODE=true")
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     cmd = sys.argv[1] if len(sys.argv) > 1 else "scan"
     if cmd == "scan":
-        scan_signals()
+        window = sys.argv[2] if len(sys.argv) > 2 else None
+        scan_signals(window)
     elif cmd == "settle":
         settle_results()
     elif cmd == "report":
