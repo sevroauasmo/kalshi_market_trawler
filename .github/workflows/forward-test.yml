@@ -1,0 +1,85 @@
+name: Forward Test Scanner
+
+on:
+  schedule:
+    # Run at multiple times (all UTC):
+    # 10am ET = 14:00 UTC (market open)
+    # 1pm ET  = 17:00 UTC
+    # 3pm ET  = 19:00 UTC (best entry from backtest)
+    # 5pm ET  = 21:00 UTC
+    - cron: '0 14 * * *'    # 10am ET
+    - cron: '0 17 * * *'    # 1pm ET
+    - cron: '0 19 * * *'    # 3pm ET
+    - cron: '0 21 * * *'    # 5pm ET
+    # Settle results at 6am ET (after markets close at midnight)
+    - cron: '0 10 * * *'    # 6am ET = settle
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Command to run (scan/settle/report)'
+        required: true
+        default: 'scan'
+      window:
+        description: 'Time window label (for scan)'
+        required: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      KALSHI_DB_URL: ${{ secrets.KALSHI_DB_URL }}
+      KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+      KALSHI_PRIVATE_KEY_PATH: /tmp/kalshi_key.txt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Write Kalshi key
+        run: echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > /tmp/kalshi_key.txt
+
+      - name: Determine command and window
+        id: cmd
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "cmd=${{ github.event.inputs.command }}" >> $GITHUB_OUTPUT
+            echo "window=${{ github.event.inputs.window }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "0 10 * * *" ]; then
+            echo "cmd=settle" >> $GITHUB_OUTPUT
+            echo "window=" >> $GITHUB_OUTPUT
+          else
+            HOUR=$(date -u +%H)
+            case $HOUR in
+              14) WINDOW="10am" ;;
+              17) WINDOW="1pm" ;;
+              19) WINDOW="3pm" ;;
+              21) WINDOW="5pm" ;;
+              *) WINDOW="$HOUR:00" ;;
+            esac
+            echo "cmd=scan" >> $GITHUB_OUTPUT
+            echo "window=$WINDOW" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run scan
+        if: steps.cmd.outputs.cmd == 'scan'
+        run: poetry run trawler fwd scan --window "${{ steps.cmd.outputs.window }}"
+
+      - name: Run settle
+        if: steps.cmd.outputs.cmd == 'settle'
+        run: |
+          poetry run trawler fwd settle
+          poetry run trawler fwd report
+
+      - name: Run report
+        if: steps.cmd.outputs.cmd == 'report'
+        run: poetry run trawler fwd report

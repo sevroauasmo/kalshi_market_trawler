@@ -9,6 +9,8 @@ Applies four filters to narrow the universe:
 import json
 import logging
 
+import psycopg2.extras
+
 from trawler.db.connection import get_connection
 
 log = logging.getLogger(__name__)
@@ -119,48 +121,62 @@ def run_filters():
 
         log.info("Screening %d series...", len(rows))
         candidates = []
-        rejected = 0
+        rejections = []  # (ticker, reason) pairs
 
         for ticker, frequency, category, settlement_sources, total_vol, market_count in rows:
             # Filter 1: Recurring
             if not frequency or frequency in NON_RECURRING:
-                _reject(conn, ticker, "not_recurring")
-                rejected += 1
+                rejections.append((ticker, "not_recurring"))
                 continue
 
             # Filter 2: Accessible settlement source
             if not _has_accessible_source(settlement_sources):
-                _reject(conn, ticker, "no_accessible_source")
-                rejected += 1
+                rejections.append((ticker, "no_accessible_source"))
                 continue
 
             # Filter 3: Volume check (only if we have market data)
             if market_count > 0 and total_vol > MAX_SERIES_VOLUME:
-                _reject(conn, ticker, f"volume_too_high:{total_vol:.0f}")
-                rejected += 1
+                rejections.append((ticker, f"volume_too_high:{total_vol:.0f}"))
                 continue
 
             # Passed all filters
             source_type = _classify_source(settlement_sources)
             candidates.append((ticker, category, source_type, total_vol, market_count))
 
-        # Mark candidates
-        for ticker, category, source_type, total_vol, market_count in candidates:
+        # Batch update rejections
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                """
+                UPDATE kalshi.series_catalog
+                SET candidate_status = 'rejected', rejection_reason = %s
+                WHERE ticker = %s
+                """,
+                [(reason, ticker) for ticker, reason in rejections],
+                page_size=500,
+            )
+        conn.commit()
+
+        # Batch update candidates
+        candidate_tickers = [(t,) for t, _, _, _, _ in candidates]
+        if candidate_tickers:
             with conn.cursor() as cur:
-                cur.execute(
+                psycopg2.extras.execute_batch(
+                    cur,
                     """
                     UPDATE kalshi.series_catalog
                     SET candidate_status = 'candidate',
                         rejection_reason = NULL
                     WHERE ticker = %s
                     """,
-                    (ticker,),
+                    candidate_tickers,
+                    page_size=500,
                 )
             conn.commit()
 
         log.info(
             "Filtering complete: %d candidates, %d rejected out of %d total",
-            len(candidates), rejected, len(rows),
+            len(candidates), len(rejections), len(rows),
         )
 
         # Log summary by source type
@@ -171,16 +187,3 @@ def run_filters():
 
     finally:
         conn.close()
-
-
-def _reject(conn, ticker: str, reason: str):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE kalshi.series_catalog
-            SET candidate_status = 'rejected', rejection_reason = %s
-            WHERE ticker = %s
-            """,
-            (reason, ticker),
-        )
-    conn.commit()

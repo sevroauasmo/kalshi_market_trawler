@@ -60,12 +60,20 @@ class KalshiClient:
         return headers
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        self.limiter.acquire()
         url = f"{self.base_url}{path}"
-        headers = self._headers("GET", path)
-        resp = self.client.get(url, params=params, headers=headers)
+        for attempt in range(4):
+            self.limiter.acquire()
+            headers = self._headers("GET", path)
+            resp = self.client.get(url, params=params, headers=headers)
+            if resp.status_code == 429:
+                backoff = 2 ** attempt
+                log.debug("Rate limited, backing off %ds...", backoff)
+                time.sleep(backoff)
+                continue
+            resp.raise_for_status()
+            return resp.json()
         resp.raise_for_status()
-        return resp.json()
+        return {}
 
     def _paginate(self, path: str, key: str, params: dict | None = None) -> Iterator[dict]:
         """Yield all items from a paginated endpoint."""
@@ -159,10 +167,29 @@ class KalshiClient:
 
     # ── Candlesticks ────────────────────────────────────────────────
 
-    def get_candlesticks(self, series_ticker: str, market_ticker: str) -> list[dict]:
-        """Get price history for a market. Returns raw candlestick dicts."""
+    def get_candlesticks(
+        self,
+        series_ticker: str,
+        market_ticker: str,
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+    ) -> list[dict]:
+        """Get hourly price history for a market. Returns raw candlestick dicts.
+
+        Args:
+            series_ticker: The series ticker (e.g. KXHIGHNY).
+            market_ticker: The market ticker (e.g. KXHIGHNY-26MAR29-B54.5).
+            start_ts: Unix timestamp for the start of the window.
+            end_ts: Unix timestamp for the end of the window.
+        """
+        params: dict = {"period_interval": 60}
+        if start_ts is not None:
+            params["start_ts"] = start_ts
+        if end_ts is not None:
+            params["end_ts"] = end_ts
         data = self._get(
-            "/series/{}/markets/{}/candlesticks".format(series_ticker, market_ticker)
+            "/series/{}/markets/{}/candlesticks".format(series_ticker, market_ticker),
+            params=params,
         )
         return data.get("candlesticks", [])
 

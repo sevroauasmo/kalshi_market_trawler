@@ -70,7 +70,7 @@ class BaseAnalyzer(ABC):
         if market_price <= 0:
             return None
 
-        estimate = self.estimate_probability(market)
+        estimate = float(self.estimate_probability(market))
         edge = estimate - market_price
         abs_edge = abs(edge)
 

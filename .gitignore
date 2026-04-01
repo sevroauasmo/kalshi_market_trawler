@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
-data/*.csv
-data/*.html
+data/
 .venv/
 dist/
 *.egg-info/
