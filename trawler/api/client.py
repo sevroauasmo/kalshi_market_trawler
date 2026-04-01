@@ -6,7 +6,7 @@ import httpx
 
 from trawler.api.auth import load_private_key, sign_request
 from trawler.api.models import Event, Market, Series
-from trawler.config import KALSHI_API_BASE, KALSHI_PRIVATE_KEY_PATH, KALSHI_RATE_LIMIT
+from trawler.config import KALSHI_API_BASE, KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, KALSHI_RATE_LIMIT
 
 log = logging.getLogger(__name__)
 
@@ -53,11 +53,75 @@ class KalshiClient:
         headers = {"Accept": "application/json"}
         if self.private_key:
             ts = int(time.time() * 1000)
-            sig = sign_request(self.private_key, ts, method, path)
-            headers["KALSHI-ACCESS-KEY"] = KALSHI_PRIVATE_KEY_PATH
+            # Kalshi requires the FULL path (including /trade-api/v2) in the signature
+            full_path = f"/trade-api/v2{path}"
+            sig = sign_request(self.private_key, ts, method, full_path)
+            headers["KALSHI-ACCESS-KEY"] = KALSHI_API_KEY_ID
             headers["KALSHI-ACCESS-TIMESTAMP"] = str(ts)
             headers["KALSHI-ACCESS-SIGNATURE"] = sig
         return headers
+
+    def _post(self, path: str, json_body: dict | None = None) -> dict:
+        self.limiter.acquire()
+        url = f"{self.base_url}{path}"
+        headers = self._headers("POST", path)
+        headers["Content-Type"] = "application/json"
+        resp = self.client.post(url, json=json_body, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _delete(self, path: str) -> dict:
+        self.limiter.acquire()
+        url = f"{self.base_url}{path}"
+        headers = self._headers("DELETE", path)
+        resp = self.client.delete(url, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_balance(self) -> dict:
+        return self._get("/portfolio/balance")
+
+    def get_positions(self) -> dict:
+        return self._get("/portfolio/positions")
+
+    def place_order(
+        self,
+        ticker: str,
+        side: str,         # "yes" or "no"
+        count: int,        # number of contracts
+        price_cents: int,  # price in cents (1-99)
+        action: str = "buy",
+        order_type: str = "limit",
+    ) -> dict:
+        """Place an order on Kalshi.
+
+        Args:
+            ticker: Market ticker (e.g., KXHIGHNY-26APR02-B54.5)
+            side: "yes" or "no"
+            count: Number of contracts
+            price_cents: Limit price in cents (1-99)
+            action: "buy" or "sell"
+            order_type: "limit" or "market"
+        """
+        body = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": count,
+            "type": order_type,
+        }
+        if order_type == "limit":
+            body["yes_price"] = price_cents if side == "yes" else (100 - price_cents)
+        return self._post("/portfolio/orders", body)
+
+    def cancel_order(self, order_id: str) -> dict:
+        return self._delete(f"/portfolio/orders/{order_id}")
+
+    def get_orders(self, ticker: str | None = None) -> dict:
+        params = {}
+        if ticker:
+            params["ticker"] = ticker
+        return self._get("/portfolio/orders", params)
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
