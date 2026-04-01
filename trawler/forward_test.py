@@ -144,21 +144,29 @@ def scan_signals(window_label=None):
             # Position sizing
             position = min(max_pos, 100) if action == "SIGNAL" else 0
 
-            # Log to DB
+            # Log to DB — upsert per (date, city, target, window)
             cur.execute("""
                 INSERT INTO kalshi.forward_test
                     (test_date, city, series_ticker, target_date, bucket_sub,
                      bucket_rank, signal_time, yes_price_at_signal, no_ask_at_signal,
                      hourly_volume, position_size, estimated_fill_no, break_even_no,
-                     ev_per_dollar, action, notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
+                     ev_per_dollar, action, scan_window, notes)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (test_date, city, target_date, scan_window)
+                DO UPDATE SET
+                    bucket_sub = EXCLUDED.bucket_sub,
+                    yes_price_at_signal = EXCLUDED.yes_price_at_signal,
+                    no_ask_at_signal = EXCLUDED.no_ask_at_signal,
+                    ev_per_dollar = EXCLUDED.ev_per_dollar,
+                    action = EXCLUDED.action,
+                    signal_time = EXCLUDED.signal_time,
+                    notes = EXCLUDED.notes
             """, (
                 today, city, series, target_date, second.yes_sub_title,
                 2, now, yes_price, 1 - yes_price,
                 second.volume or 0, position, 1 - yes_price + 0.01, be_no,
-                round(ev, 4), action,
-                f"window={scan_label} fav={fav.yes_sub_title}@{fav.last_price:.2f} {reason}",
+                round(ev, 4), action, scan_label,
+                f"fav={fav.yes_sub_title}@{fav.last_price:.2f} {reason}",
             ))
 
             color = {"SIGNAL": "green", "MARGINAL": "yellow", "SKIP": "dim"}[action]
@@ -180,45 +188,64 @@ def scan_signals(window_label=None):
 
     # ─── LIVE MODE: Place orders ─────────────────────────────────
     if LIVE_MODE and signals:
-        console.print(f"\n[red bold]LIVE MODE: Placing {len(signals)} orders[/red bold]")
+        console.print(f"\n[red bold]LIVE MODE: {len(signals)} signals[/red bold]")
 
-        # Use authenticated client for trading
         trade_client = KalshiClient(authenticated=True)
 
-        # Safety: check balance first
+        # Safety: check balance
         try:
             bal = trade_client.get_balance()
             balance_dollars = bal.get("balance", 0) / 100
-            console.print(f"  Account balance: ${balance_dollars:.2f}")
+            console.print(f"  Balance: ${balance_dollars:.2f}")
         except Exception as e:
-            console.print(f"  [red]Failed to check balance: {e}. Aborting trades.[/red]")
+            console.print(f"  [red]Balance check failed: {e}. Aborting.[/red]")
             trade_client.close()
             client.close()
             return
 
+        # Safety: check what we've already traded today to avoid double-ordering
+        conn2 = get_connection()
+        cur2 = conn2.cursor()
+        cur2.execute("""
+            SELECT target_date, city FROM kalshi.forward_test
+            WHERE test_date = %s AND notes LIKE '%%LIVE order=%%'
+        """, (today,))
+        already_traded = set((r[0], r[1]) for r in cur2.fetchall())
+        conn2.close()
+
         for sig in signals:
             ticker = sig["ticker"]
+            city = sig["city"]
+            target = sig["target"]
+
+            # Don't double-trade the same city+target
+            if (target, city) in already_traded:
+                console.print(f"  [dim]{city} {target}: already traded today, skipping[/dim]")
+                continue
+
             yes_price = sig["yes_price"]
             no_price_cents = int((1 - yes_price) * 100)
-            position_dollars = sig["position"]
 
-            # How many contracts can we buy?
-            # Each NO contract costs no_price_cents cents
+            # Guard: no_price must be between 1-99
+            if no_price_cents <= 0 or no_price_cents >= 100:
+                console.print(f"  [red]{city} {ticker}: invalid NO price {no_price_cents}c, skipping[/red]")
+                continue
+
+            position_dollars = sig["position"]
             contracts = int(position_dollars * 100 / no_price_cents)
             total_cost = contracts * no_price_cents / 100
 
-            # Safety: don't spend more than balance
-            if total_cost > balance_dollars - 0.10:  # keep 10c buffer
-                contracts = int((balance_dollars - 0.10) * 100 / no_price_cents)
+            # Safety: don't exceed balance (keep $1 buffer)
+            if total_cost > balance_dollars - 1.00:
+                contracts = int((balance_dollars - 1.00) * 100 / no_price_cents)
                 total_cost = contracts * no_price_cents / 100
 
             if contracts <= 0:
-                console.print(f"  [yellow]{sig['city']} {ticker}: insufficient balance "
-                              f"(need ${position_dollars:.0f}, have ${balance_dollars:.2f})[/yellow]")
+                console.print(f"  [yellow]{city}: insufficient balance "
+                              f"(need ~${position_dollars:.0f}, have ${balance_dollars:.2f})[/yellow]")
                 continue
 
-            console.print(f"  Placing: BUY {contracts} NO @ {no_price_cents}c on {ticker} "
-                          f"(${total_cost:.2f})")
+            console.print(f"  → BUY {contracts} NO @ {no_price_cents}c on {ticker} (${total_cost:.2f})")
 
             try:
                 order = trade_client.place_order(
@@ -229,47 +256,44 @@ def scan_signals(window_label=None):
                     action="buy",
                     order_type="limit",
                 )
-                order_data = order.get("order", {})
-                status = order_data.get("status", "unknown")
-                filled = order_data.get("fill_count_fp", "0")
-                order_id = order_data.get("order_id", "")
-                fees = order_data.get("taker_fees_dollars", "0")
+                od = order.get("order", {})
+                status = od.get("status", "unknown")
+                filled = od.get("fill_count_fp", "0")
+                order_id = od.get("order_id", "")
+                fees = od.get("taker_fees_dollars", "0")
 
-                if status == "executed":
-                    console.print(f"  [green]FILLED: {filled} contracts, "
-                                  f"fees=${float(fees):.2f}, order={order_id}[/green]")
-                elif status == "resting":
-                    console.print(f"  [yellow]RESTING: {filled} filled so far, "
-                                  f"order={order_id}[/yellow]")
-                else:
-                    console.print(f"  [yellow]Status: {status}, order={order_id}[/yellow]")
+                color = "green" if status == "executed" else "yellow"
+                console.print(f"  [{color}]{status.upper()}: filled={filled}, "
+                              f"fees=${float(fees):.2f}, id={order_id[:12]}[/{color}]")
 
-                # Update the forward_test row with order details
-                cur2 = conn.cursor() if not conn.closed else get_connection().cursor()
-                conn2 = conn if not conn.closed else get_connection()
-                cur2.execute("""
+                # Log order to DB
+                conn3 = get_connection()
+                cur3 = conn3.cursor()
+                cur3.execute("""
                     UPDATE kalshi.forward_test
-                    SET notes = notes || %s
-                    WHERE test_date = %s AND series_ticker = %s
-                      AND target_date = %s AND bucket_sub = %s
+                    SET notes = COALESCE(notes, '') || %s,
+                        position_size = %s
+                    WHERE test_date = %s AND city = %s
+                      AND target_date = %s AND scan_window = %s
                 """, (
-                    f" | LIVE order={order_id} status={status} "
-                    f"filled={filled} cost=${total_cost:.2f}",
-                    today, sig["series"], sig["target"], sig["sub"],
+                    f" | LIVE order={order_id} {status} "
+                    f"filled={filled} cost=${total_cost:.2f} fees=${float(fees):.2f}",
+                    total_cost, today, city, target, scan_label,
                 ))
-                conn2.commit()
+                conn3.commit()
+                conn3.close()
 
-                # Update balance
                 balance_dollars -= total_cost
+                already_traded.add((target, city))
 
             except Exception as e:
-                console.print(f"  [red]ORDER FAILED: {e}[/red]")
+                console.print(f"  [red]FAILED: {e}[/red]")
                 log.error("Order failed for %s: %s", ticker, e, exc_info=True)
 
         trade_client.close()
 
     elif LIVE_MODE:
-        console.print("\n[yellow]LIVE MODE active but no signals today[/yellow]")
+        console.print("\n[yellow]LIVE MODE: no signals[/yellow]")
 
     client.close()
     console.print(f"\nLogged {len(signals)} signals, "

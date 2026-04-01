@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS kalshi.forward_test (
     break_even_no NUMERIC,
     ev_per_dollar NUMERIC,
     action TEXT,
+    scan_window TEXT,
     actual_result TEXT,
     actual_pnl NUMERIC,
     settled_at TIMESTAMPTZ,
