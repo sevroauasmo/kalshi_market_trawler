@@ -89,7 +89,7 @@ class KalshiClient:
         ticker: str,
         side: str,         # "yes" or "no"
         count: int,        # number of contracts
-        price_cents: int,  # price in cents (1-99)
+        price_cents: int,  # price in cents (1-99), from the perspective of `side`
         action: str = "buy",
         order_type: str = "limit",
     ) -> dict:
@@ -99,19 +99,35 @@ class KalshiClient:
             ticker: Market ticker (e.g., KXHIGHNY-26APR02-B54.5)
             side: "yes" or "no"
             count: Number of contracts
-            price_cents: Limit price in cents (1-99)
+            price_cents: Limit price in cents (1-99). If side="no" and price_cents=75,
+                         you're buying NO at 75c (equivalent to selling YES at 25c).
             action: "buy" or "sell"
             order_type: "limit" or "market"
+
+        Safety: This method will refuse to sell unless explicitly confirmed.
+        Our strategy is buy-and-hold to settlement — we never sell positions.
         """
+        if action == "sell":
+            raise ValueError(
+                "Selling is disabled for safety. Our strategy holds to settlement. "
+                "If you really need to sell, use the Kalshi web UI."
+            )
+
+        # Kalshi API always takes yes_price in cents
+        # If buying NO at 75c, yes_price = 100 - 75 = 25c
+        if side == "no":
+            yes_price = 100 - price_cents
+        else:
+            yes_price = price_cents
+
         body = {
             "ticker": ticker,
             "action": action,
             "side": side,
             "count": count,
             "type": order_type,
+            "yes_price": yes_price,
         }
-        if order_type == "limit":
-            body["yes_price"] = price_cents if side == "yes" else (100 - price_cents)
         return self._post("/portfolio/orders", body)
 
     def cancel_order(self, order_id: str) -> dict:

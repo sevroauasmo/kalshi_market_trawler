@@ -180,20 +180,94 @@ def scan_signals(window_label=None):
 
     # ─── LIVE MODE: Place orders ─────────────────────────────────
     if LIVE_MODE and signals:
-        console.print(f"\n[red bold]LIVE MODE: Would place {len(signals)} orders[/red bold]")
+        console.print(f"\n[red bold]LIVE MODE: Placing {len(signals)} orders[/red bold]")
+
+        # Use authenticated client for trading
+        trade_client = KalshiClient(authenticated=True)
+
+        # Safety: check balance first
+        try:
+            bal = trade_client.get_balance()
+            balance_dollars = bal.get("balance", 0) / 100
+            console.print(f"  Account balance: ${balance_dollars:.2f}")
+        except Exception as e:
+            console.print(f"  [red]Failed to check balance: {e}. Aborting trades.[/red]")
+            trade_client.close()
+            client.close()
+            return
+
         for sig in signals:
-            no_price = 1 - sig["yes_price"]
-            contracts = int(sig["position"] / no_price)
-            console.print(
-                f"  → BUY {contracts} NO on {sig['ticker']} @ {no_price:.2f} "
-                f"(${sig['position']:.0f})"
-            )
-            # TODO: Implement actual order placement via Kalshi API
-            # client_auth = KalshiClient(authenticated=True)
-            # client_auth.place_order(ticker=sig['ticker'], side='no',
-            #                         count=contracts, price=no_price)
-        console.print("[red]Order placement not yet implemented — "
-                      "set up authenticated API access first[/red]")
+            ticker = sig["ticker"]
+            yes_price = sig["yes_price"]
+            no_price_cents = int((1 - yes_price) * 100)
+            position_dollars = sig["position"]
+
+            # How many contracts can we buy?
+            # Each NO contract costs no_price_cents cents
+            contracts = int(position_dollars * 100 / no_price_cents)
+            total_cost = contracts * no_price_cents / 100
+
+            # Safety: don't spend more than balance
+            if total_cost > balance_dollars - 0.10:  # keep 10c buffer
+                contracts = int((balance_dollars - 0.10) * 100 / no_price_cents)
+                total_cost = contracts * no_price_cents / 100
+
+            if contracts <= 0:
+                console.print(f"  [yellow]{sig['city']} {ticker}: insufficient balance "
+                              f"(need ${position_dollars:.0f}, have ${balance_dollars:.2f})[/yellow]")
+                continue
+
+            console.print(f"  Placing: BUY {contracts} NO @ {no_price_cents}c on {ticker} "
+                          f"(${total_cost:.2f})")
+
+            try:
+                order = trade_client.place_order(
+                    ticker=ticker,
+                    side="no",
+                    count=contracts,
+                    price_cents=no_price_cents,
+                    action="buy",
+                    order_type="limit",
+                )
+                order_data = order.get("order", {})
+                status = order_data.get("status", "unknown")
+                filled = order_data.get("fill_count_fp", "0")
+                order_id = order_data.get("order_id", "")
+                fees = order_data.get("taker_fees_dollars", "0")
+
+                if status == "executed":
+                    console.print(f"  [green]FILLED: {filled} contracts, "
+                                  f"fees=${float(fees):.2f}, order={order_id}[/green]")
+                elif status == "resting":
+                    console.print(f"  [yellow]RESTING: {filled} filled so far, "
+                                  f"order={order_id}[/yellow]")
+                else:
+                    console.print(f"  [yellow]Status: {status}, order={order_id}[/yellow]")
+
+                # Update the forward_test row with order details
+                cur2 = conn.cursor() if not conn.closed else get_connection().cursor()
+                conn2 = conn if not conn.closed else get_connection()
+                cur2.execute("""
+                    UPDATE kalshi.forward_test
+                    SET notes = notes || %s
+                    WHERE test_date = %s AND series_ticker = %s
+                      AND target_date = %s AND bucket_sub = %s
+                """, (
+                    f" | LIVE order={order_id} status={status} "
+                    f"filled={filled} cost=${total_cost:.2f}",
+                    today, sig["series"], sig["target"], sig["sub"],
+                ))
+                conn2.commit()
+
+                # Update balance
+                balance_dollars -= total_cost
+
+            except Exception as e:
+                console.print(f"  [red]ORDER FAILED: {e}[/red]")
+                log.error("Order failed for %s: %s", ticker, e, exc_info=True)
+
+        trade_client.close()
+
     elif LIVE_MODE:
         console.print("\n[yellow]LIVE MODE active but no signals today[/yellow]")
 
