@@ -34,6 +34,12 @@ ET = ZoneInfo("America/New_York")
 # ─── CONFIGURATION ───────────────────────────────────────────────
 LIVE_MODE = os.environ.get("KALSHI_LIVE_MODE", "false").lower() == "true"
 
+# The window at which we TRADE (place real orders in live mode).
+# Other windows are logged for monitoring only.
+# Backtest showed 3pm ET as best entry. Second-fav changes 60% of the time
+# between windows, so we must lock to ONE window.
+TRADE_WINDOW = "3pm"
+
 # Cities to trade. Based on realistic sim:
 # NYC: +$8,517/98 days, 85% win rate, 14.2% ROI — PRIMARY
 # Miami: +$216/98 days, 88% win rate — small sidecar
@@ -187,8 +193,14 @@ def scan_signals(window_label=None):
     conn.close()
 
     # ─── LIVE MODE: Place orders ─────────────────────────────────
-    if LIVE_MODE and signals:
-        console.print(f"\n[red bold]LIVE MODE: {len(signals)} signals[/red bold]")
+    # Only trade at the designated window (backtest validated 3pm ET)
+    is_trade_window = scan_label == TRADE_WINDOW
+    if LIVE_MODE and signals and not is_trade_window:
+        console.print(f"\n[yellow]LIVE MODE: {len(signals)} signals but window={scan_label}, "
+                      f"not {TRADE_WINDOW}. Logging only, not trading.[/yellow]")
+    elif LIVE_MODE and signals and is_trade_window:
+        console.print(f"\n[red bold]LIVE MODE ({TRADE_WINDOW} window): "
+                      f"Placing {len(signals)} orders[/red bold]")
 
         trade_client = KalshiClient(authenticated=True)
 
@@ -292,7 +304,7 @@ def scan_signals(window_label=None):
 
         trade_client.close()
 
-    elif LIVE_MODE:
+    elif LIVE_MODE and not signals:
         console.print("\n[yellow]LIVE MODE: no signals[/yellow]")
 
     client.close()
