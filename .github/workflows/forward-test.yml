@@ -11,8 +11,8 @@ on:
     - cron: '0 17 * * *'    # 1pm ET
     - cron: '0 19 * * *'    # 3pm ET
     - cron: '0 21 * * *'    # 5pm ET
-    # Settle results at 6am ET (after markets close at midnight)
-    - cron: '0 10 * * *'    # 6am ET = settle
+    # Settle results at 8am ET (markets close ~1am ET, Kalshi finalizes by ~2am)
+    - cron: '0 12 * * *'    # 8am ET = settle
   workflow_dispatch:
     inputs:
       command:
@@ -55,7 +55,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "cmd=${{ github.event.inputs.command }}" >> $GITHUB_OUTPUT
             echo "window=${{ github.event.inputs.window }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.schedule }}" = "0 10 * * *" ]; then
+          elif [ "${{ github.event.schedule }}" = "0 12 * * *" ]; then
             echo "cmd=settle" >> $GITHUB_OUTPUT
             echo "window=" >> $GITHUB_OUTPUT
           else
